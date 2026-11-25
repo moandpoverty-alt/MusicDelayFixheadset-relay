@@ -1,0 +1,465 @@
+================================================================================
+FILE: HeadsetDelayService.kt
+DESC: خدمة الاعتراض والمؤقت القابل للتعديل (0.5–3.0 ث) مع استهداف YouTube Music
+================================================================================
+
+package com.headsetdelay.ytm
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.media.AudioManager
+import android.media.session.MediaController
+import android.media.session.MediaSession
+import android.media.session.MediaSessionManager
+import android.media.session.PlaybackState
+import android.os.Build
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.os.PowerManager
+import android.os.SystemClock
+import android.service.notification.NotificationListenerService
+import android.view.KeyEvent
+import androidx.core.app.NotificationCompat
+
+/**
+ * خدمة النسخة الأولية لنظام Android 16 (API 36)
+ * - تستهدف حزمة YouTube Music: com.google.android.apps.youtube.music
+ * - تأخير قابل للتعديل من 500ms (0.5 ث) إلى 3000ms (3 ثوانٍ)
+ * - التأخير الافتراضي: 1000ms (ثانية واحدة)
+ * - الاستراتيجية الحالية: تأجيل وتمرير آخر أمر فقط (إلغاء الضغطات المكررة ضمن نافذة التأخير)
+ */
+class HeadsetDelayService : Service() {
+
+    companion object {
+        const val TARGET_YTM_PACKAGE = "com.google.android.apps.youtube.music"
+        const val MIN_DELAY_MS = 500L
+        const val MAX_DELAY_MS = 3000L
+        const val DEFAULT_DELAY_MS = 1000L
+
+        const val ACTION_UPDATE_CONFIG = "com.headsetdelay.ytm.UPDATE_CONFIG"
+        const val EXTRA_DELAY_MS = "extra_delay_ms"
+        const val EXTRA_ENABLED = "extra_enabled"
+        private const val CHANNEL_ID = "headset_delay_channel"
+        private const val NOTIFICATION_ID = 1601
+    }
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var mediaSession: MediaSession? = null
+    private var pendingRunnable: Runnable? = null
+
+    private var delayMs: Long = 1000L.coerceIn(MIN_DELAY_MS, MAX_DELAY_MS)
+    private var isInterceptionEnabled: Boolean = true
+
+    private lateinit var audioManager: AudioManager
+    private lateinit var mediaSessionManager: MediaSessionManager
+    private lateinit var powerManager: PowerManager
+
+    override fun onCreate() {
+        super.onCreate()
+        audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        mediaSessionManager = getSystemService(Context.MEDIA_SESSION_SERVICE) as MediaSessionManager
+        powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+
+        createNotificationChannel()
+        startForeground(NOTIFICATION_ID, buildForegroundNotification())
+        setupInterceptorMediaSession()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_UPDATE_CONFIG) {
+            delayMs = intent.getLongExtra(EXTRA_DELAY_MS, DEFAULT_DELAY_MS)
+                .coerceIn(MIN_DELAY_MS, MAX_DELAY_MS)
+            isInterceptionEnabled = intent.getBooleanExtra(EXTRA_ENABLED, true)
+            updateNotification()
+        }
+        return START_STICKY
+    }
+
+    private fun setupInterceptorMediaSession() {
+        mediaSession = MediaSession(this, "HeadsetDelayYTMProxy").apply {
+            setFlags(
+                MediaSession.FLAG_HANDLES_MEDIA_BUTTONS or
+                    MediaSession.FLAG_HANDLES_TRANSPORT_CONTROLS
+            )
+
+            setPlaybackState(
+                PlaybackState.Builder()
+                    .setActions(
+                        PlaybackState.ACTION_PLAY or
+                            PlaybackState.ACTION_PAUSE or
+                            PlaybackState.ACTION_PLAY_PAUSE or
+                            PlaybackState.ACTION_SKIP_TO_NEXT or
+                            PlaybackState.ACTION_SKIP_TO_PREVIOUS
+                    )
+                    .setState(PlaybackState.STATE_PAUSED, 0L, 1.0f)
+                    .build()
+            )
+
+            setCallback(object : MediaSession.Callback() {
+                override fun onMediaButtonEvent(mediaButtonIntent: Intent): Boolean {
+                    val keyEvent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        mediaButtonIntent.getParcelableExtra(
+                            Intent.EXTRA_KEY_EVENT,
+                            KeyEvent::class.java
+                        )
+                    } else {
+                        @Suppress("DEPRECATION")
+                        mediaButtonIntent.getParcelableExtra(Intent.EXTRA_KEY_EVENT)
+                    } ?: return super.onMediaButtonEvent(mediaButtonIntent)
+
+                    if (keyEvent.action == KeyEvent.ACTION_DOWN) {
+                        handleIncomingHeadsetKey(keyEvent)
+                    }
+                    return true
+                }
+            })
+
+            isActive = true
+        }
+    }
+
+    private fun handleIncomingHeadsetKey(keyEvent: KeyEvent) {
+        if (!isInterceptionEnabled) {
+            forwardToYouTubeMusic(keyEvent.keyCode)
+            return
+        }
+
+        // إبقاء المعالج نشطاً مؤقتاً خلال نافذة التأخير (بحد أقصى 4 ثوانٍ)
+        val wakeLock = powerManager.newWakeLock(
+            PowerManager.PARTIAL_WAKE_LOCK,
+            "HeadsetDelay::DelayWindowLock"
+        )
+        wakeLock.acquire(MAX_DELAY_MS + 1000L)
+
+        // إلغاء أي أمر سابق معلّق لتطبيق سياسة التأجيل ومنع الارتداد
+        pendingRunnable?.let { mainHandler.removeCallbacks(it) }
+
+        val task = Runnable {
+            try {
+                forwardToYouTubeMusic(keyEvent.keyCode)
+            } finally {
+                if (wakeLock.isHeld) {
+                    wakeLock.release()
+                }
+            }
+        }
+        pendingRunnable = task
+        mainHandler.postDelayed(task, delayMs)
+    }
+
+    /**
+     * يحاول تمرير أمر زر السماعة إلى YouTube Music بعد انتهاء التأخير:
+     * 1. عبر MediaController الخاص بحزمة com.google.android.apps.youtube.music
+     * 2. كبديل احتياطي عبر AudioManager.dispatchMediaKeyEvent
+     */
+    private fun forwardToYouTubeMusic(keyCode: Int) {
+        val listenerComponent = ComponentName(this, MediaNotificationBridge::class.java)
+        val activeSessions: List<MediaController> = try {
+            mediaSessionManager.getActiveSessions(listenerComponent)
+        } catch (_: SecurityException) {
+            emptyList()
+        }
+
+        val ytmController = activeSessions.firstOrNull {
+            it.packageName == TARGET_YTM_PACKAGE
+        }
+
+        if (ytmController != null) {
+            val controls = ytmController.transportControls
+            when (keyCode) {
+                KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
+                KeyEvent.KEYCODE_HEADSETHOOK -> {
+                    val isPlaying = ytmController.playbackState?.state == PlaybackState.STATE_PLAYING
+                    if (isPlaying) controls.pause() else controls.play()
+                }
+                KeyEvent.KEYCODE_MEDIA_PLAY -> controls.play()
+                KeyEvent.KEYCODE_MEDIA_PAUSE -> controls.pause()
+                KeyEvent.KEYCODE_MEDIA_NEXT -> controls.skipToNext()
+                KeyEvent.KEYCODE_MEDIA_PREVIOUS -> controls.skipToPrevious()
+                else -> dispatchFallbackMediaKey(keyCode)
+            }
+            return
+        }
+
+        // محاولة التمرير البديلة عبر نظام الصوت عند عدم توفر جلسة نشطة
+        dispatchFallbackMediaKey(keyCode)
+    }
+
+    private fun dispatchFallbackMediaKey(keyCode: Int) {
+        // تعطيل الجلسة المعترضة لحظياً لمنع الحلقة التكرارية أثناء إعادة التوجيه
+        mediaSession?.isActive = false
+        val now = SystemClock.uptimeMillis()
+        audioManager.dispatchMediaKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_DOWN, keyCode, 0))
+        audioManager.dispatchMediaKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_UP, keyCode, 0))
+        mainHandler.postDelayed({ mediaSession?.isActive = true }, 120L)
+    }
+
+    private fun createNotificationChannel() {
+        val channel = NotificationChannel(
+            CHANNEL_ID,
+            "خدمة تأخير زر السماعة",
+            NotificationManager.IMPORTANCE_LOW
+        )
+        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+    }
+
+    private fun buildForegroundNotification(): Notification {
+        val status = if (isInterceptionEnabled) {
+            "نشط · تأخير ${delayMs}ms نحو YouTube Music"
+        } else {
+            "متوقف مؤقتاً"
+        }
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("مُرحّل السماعة لـ YouTube Music")
+            .setContentText(status)
+            .setSmallIcon(android.R.drawable.ic_media_play)
+            .setOngoing(true)
+            .build()
+    }
+
+    private fun updateNotification() {
+        getSystemService(NotificationManager::class.java)
+            .notify(NOTIFICATION_ID, buildForegroundNotification())
+    }
+
+    override fun onDestroy() {
+        pendingRunnable?.let { mainHandler.removeCallbacks(it) }
+        mediaSession?.release()
+        super.onDestroy()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+}
+
+class MediaNotificationBridge : NotificationListenerService()
+
+
+================================================================================
+FILE: MainActivity.kt
+DESC: واجهة Android 16 Jetpack Compose للتحكم في التأخير وحالة الخدمة
+================================================================================
+
+package com.headsetdelay.ytm
+
+import android.content.Intent
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.layout.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+import kotlin.math.roundToLong
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+        setContent {
+            MaterialTheme {
+                HeadsetDelayPrototypeScreen(
+                    initialDelayMs = 1000L,
+                    initialEnabled = true,
+                    onApplyConfig = { delayMs, enabled ->
+                        val intent = Intent(this, HeadsetDelayService::class.java).apply {
+                            action = HeadsetDelayService.ACTION_UPDATE_CONFIG
+                            putExtra(HeadsetDelayService.EXTRA_DELAY_MS, delayMs)
+                            putExtra(HeadsetDelayService.EXTRA_ENABLED, enabled)
+                        }
+                        startForegroundService(intent)
+                    }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun HeadsetDelayPrototypeScreen(
+    initialDelayMs: Long,
+    initialEnabled: Boolean,
+    onApplyConfig: (Long, Boolean) -> Unit
+) {
+    var delayMs by remember { mutableLongStateOf(initialDelayMs) }
+    var serviceEnabled by remember { mutableStateOf(initialEnabled) }
+
+    Scaffold { padding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .padding(24.dp),
+            verticalArrangement = Arrangement.spacedBy(20.dp)
+        ) {
+            Text(
+                text = "مُرحّل السماعة — Android 16",
+                style = MaterialTheme.typography.headlineSmall
+            )
+            Text(
+                text = "التطبيق المستهدف: YouTube Music (com.google.android.apps.youtube.music)",
+                style = MaterialTheme.typography.bodyMedium
+            )
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("تفعيل تأخير زر السماعة")
+                Switch(
+                    checked = serviceEnabled,
+                    onCheckedChange = {
+                        serviceEnabled = it
+                        onApplyConfig(delayMs, serviceEnabled)
+                    }
+                )
+            }
+
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    text = String.format("التأخير الحالي: %.1f ثانية (%d ms)", delayMs / 1000f, delayMs),
+                    style = MaterialTheme.typography.titleMedium
+                )
+                Slider(
+                    value = delayMs.toFloat(),
+                    onValueChange = { raw ->
+                        val snapped = (raw / 100f).roundToLong() * 100L
+                        delayMs = snapped.coerceIn(
+                            HeadsetDelayService.MIN_DELAY_MS,
+                            HeadsetDelayService.MAX_DELAY_MS
+                        )
+                    },
+                    onValueChangeFinished = {
+                        onApplyConfig(delayMs, serviceEnabled)
+                    },
+                    valueRange = 500f..3000f,
+                    steps = 24
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text("0.5 ث", style = MaterialTheme.typography.labelSmall)
+                    Text("1.0 ث (افتراضي)", style = MaterialTheme.typography.labelSmall)
+                    Text("3.0 ث", style = MaterialTheme.typography.labelSmall)
+                }
+            }
+
+            OutlinedButton(
+                onClick = {
+                    delayMs = HeadsetDelayService.DEFAULT_DELAY_MS
+                    onApplyConfig(delayMs, serviceEnabled)
+                }
+            ) {
+                Text("إعادة الضبط إلى الافتراضي (1.0 ثانية)")
+            }
+        }
+    }
+}
+
+
+================================================================================
+FILE: AndroidManifest.xml
+DESC: أذونات Android 16 للخدمة الأمامية وتمرير أوامر الوسائط لحزمة YouTube Music
+================================================================================
+
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- أذونات الخدمة الأمامية وإدارة الطاقة لنظام Android 16 (API 36) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- التصريح باستعلام حزمة YouTube Music وفق قيود الحزم في Android -->
+    <queries>
+        <package android:name="com.google.android.apps.youtube.music" />
+    </queries>
+
+    <application
+        android:allowBackup="true"
+        android:label="HeadsetDelay YTM"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Material3.DayNight.NoActionBar">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".HeadsetDelayService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
+
+        <!-- جسر الوصول إلى جلسات الوسائط النشطة لتوجيه الأوامر إلى YouTube Music -->
+        <service
+            android:name=".MediaNotificationBridge"
+            android:exported="true"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
+    </application>
+</manifest>
+
+
+================================================================================
+FILE: build.gradle.kts
+DESC: إعدادات البناء المخصصة لـ Android 16 (compileSdk = 36 / targetSdk = 36)
+================================================================================
+
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
+}
+
+android {
+    namespace = "com.headsetdelay.ytm"
+    compileSdk = 36 // Android 16
+
+    defaultConfig {
+        applicationId = "com.headsetdelay.ytm"
+        minSdk = 34
+        targetSdk = 36 // مخصص لـ Android 16
+        versionCode = 1
+        versionName = "0.1.0-prototype"
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+    buildFeatures {
+        compose = true
+    }
+}
+
+dependencies {
+    implementation("androidx.core:core-ktx:1.15.0")
+    implementation("androidx.activity:activity-compose:1.10.0")
+    implementation(platform("androidx.compose:compose-bom:2025.02.00"))
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.material3:material3")
+}
+
